@@ -140,6 +140,7 @@ public class NetworkClient implements KafkaClient {
              defaultRequestTimeoutMs,
              clientDnsLookup,
              time,
+             false,
              discoverBrokerVersions,
              apiVersions,
              null,
@@ -173,6 +174,7 @@ public class NetworkClient implements KafkaClient {
              defaultRequestTimeoutMs,
              clientDnsLookup,
              time,
+             false,
              discoverBrokerVersions,
              apiVersions,
              throttleTimeSensor,
@@ -205,6 +207,7 @@ public class NetworkClient implements KafkaClient {
              defaultRequestTimeoutMs,
              clientDnsLookup,
              time,
+             false,
              discoverBrokerVersions,
              apiVersions,
              null,
@@ -223,6 +226,7 @@ public class NetworkClient implements KafkaClient {
                           int defaultRequestTimeoutMs,
                           ClientDnsLookup clientDnsLookup,
                           Time time,
+                          boolean updateMetadataWithBootstrap,
                           boolean discoverBrokerVersions,
                           ApiVersions apiVersions,
                           Sensor throttleTimeSensor,
@@ -234,7 +238,7 @@ public class NetworkClient implements KafkaClient {
         if (metadataUpdater == null) {
             if (metadata == null)
                 throw new IllegalArgumentException("`metadata` must not be null");
-            this.metadataUpdater = new DefaultMetadataUpdater(metadata);
+            this.metadataUpdater = new DefaultMetadataUpdater(metadata, updateMetadataWithBootstrap);
         } else {
             this.metadataUpdater = metadataUpdater;
         }
@@ -608,6 +612,18 @@ public class NetworkClient implements KafkaClient {
         List<Node> nodes = this.metadataUpdater.fetchNodes();
         if (nodes.isEmpty())
             throw new IllegalStateException("There are no nodes in the Kafka cluster");
+        return leastLoadedNode(now, nodes);
+    }
+
+    /**
+     * Choose the node with the fewest outstanding requests which is at least eligible for connection. This method will
+     * prefer a node with an existing connection, but will potentially choose a node for which we don't yet have a
+     * connection if all existing connections are in use. This method will never choose a node for which there is no
+     * existing connection and from which we have disconnected within the reconnect backoff period.
+     *
+     * @return The node with the fewest in-flight requests.
+     */
+    private Node leastLoadedNode(long now, List<Node> nodes) {
         int inflight = Integer.MAX_VALUE;
         Node found = null;
 
@@ -894,11 +910,20 @@ public class NetworkClient implements KafkaClient {
         /* the current cluster metadata */
         private final Metadata metadata;
 
+        /* the initial bootstrap cluster */
+        private final Cluster bootstrapCluster;
+        private final boolean updateWithBootstrap;
+
         /* true iff there is a metadata request that has been sent and for which we have not yet received a response */
         private boolean metadataFetchInProgress;
-
         DefaultMetadataUpdater(Metadata metadata) {
+            this(metadata, false);
+        }
+
+        DefaultMetadataUpdater(Metadata metadata, Boolean updateWithBootstrap) {
             this.metadata = metadata;
+            this.bootstrapCluster = metadata.fetch();
+            this.updateWithBootstrap = updateWithBootstrap;
             this.metadataFetchInProgress = false;
         }
 
@@ -926,7 +951,9 @@ public class NetworkClient implements KafkaClient {
 
             // Beware that the behavior of this method and the computation of timeouts for poll() are
             // highly dependent on the behavior of leastLoadedNode.
-            Node node = leastLoadedNode(now);
+            List<Node> nodes = updateWithBootstrap ? bootstrapCluster.nodes() : fetchNodes();
+            Node node = leastLoadedNode(now, nodes);
+
             if (node == null) {
                 log.debug("Give up sending metadata request since no node is available");
                 return reconnectBackoffMs;
